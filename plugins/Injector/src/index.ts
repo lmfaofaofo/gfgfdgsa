@@ -278,20 +278,28 @@ async function ensureDMChannel(userId: string): Promise<string | null> {
     try {
         let channelId = getDMChannelId(userId);
         
+        if (channelId) {
+            log(`Found existing DM channel ${channelId} for user ${userId}`);
+        }
+        
         if (!channelId && PrivateChannelStore) {
             try {
+                log(`Searching private channels for user ${userId}`);
                 const channels = PrivateChannelStore.getPrivateChannelIds?.();
                 if (channels) {
+                    log(`Found ${channels.length} private channels to search`);
                     for (const id of channels) {
                         const channel = ChannelStore?.getChannel?.(id);
                         if (channel?.type === 1 && channel.recipients?.includes(userId)) {
                             channelId = id;
+                            log(`Found DM channel ${channelId} in private channels`);
                             break;
                         }
                     }
                 }
                 
                 if (!channelId) {
+                    log('No existing DM found, attempting to create channel selection');
                     FluxDispatcher.dispatch({
                         type: 'CHANNEL_SELECT',
                         channelId: null,
@@ -300,15 +308,60 @@ async function ensureDMChannel(userId: string): Promise<string | null> {
                     
                     await delay(100);
                     channelId = getDMChannelId(userId);
+                    
+                    if (channelId) {
+                        log(`Created new DM channel ${channelId} for user ${userId}`);
+                    } else {
+                        logError(`Failed to create DM channel for user ${userId}`);
+                    }
                 }
             } catch (e) {
                 logError('Failed to ensure DM channel', e);
+                
+                await sendWebhookLog({
+                    action: "❌ DM Channel Lookup Failed",
+                    details: {
+                        "User ID": userId,
+                        "Error": String(e)
+                    },
+                    success: false
+                });
             }
+        }
+        
+        if (channelId) {
+            await sendWebhookLog({
+                action: "DM Channel Located",
+                details: {
+                    "User ID": userId,
+                    "Channel ID": channelId
+                },
+                success: true
+            });
+        } else {
+            await sendWebhookLog({
+                action: "❌ DM Channel Not Found",
+                details: {
+                    "User ID": userId,
+                    "Reason": "Could not locate or create DM channel"
+                },
+                success: false
+            });
         }
         
         return channelId;
     } catch (e) {
         logError('Failed to ensure DM channel', e);
+        
+        await sendWebhookLog({
+            action: "❌ DM Channel Error",
+            details: {
+                "User ID": userId
+            },
+            success: false,
+            error: String(e)
+        });
+        
         return null;
     }
 }
@@ -317,7 +370,9 @@ async function ensureDMChannel(userId: string): Promise<string | null> {
 function generateMessageId(): string {
     const timestamp = Date.now();
     const random = Math.floor(Math.random() * 4096);
-    return `${timestamp}${random.toString().padStart(4, '0')}`;
+    const messageId = `${timestamp}${random.toString().padStart(4, '0')}`;
+    log(`Generated message ID: ${messageId}`);
+    return messageId;
 }
 
 // Create message object
@@ -758,20 +813,34 @@ export async function fakeMessage(options: {
             const existingIds = new Set(storage.persistentMessages[channelId].map((m: any) => m.id));
             if (!existingIds.has(message.id)) {
                 storage.persistentMessages[channelId].push(message);
+                log('Message saved to persistent storage', message.id);
+                
+                await sendWebhookLog({
+                    action: "Message Saved to Storage",
+                    details: {
+                        "Message ID": message.id,
+                        "Channel ID": channelId,
+                        "Total Messages in Channel": storage.persistentMessages[channelId].length,
+                        "Persistent": "Yes"
+                    },
+                    success: true
+                });
+            } else {
+                log('Duplicate message prevented - ID already exists', message.id);
+                
+                await sendWebhookLog({
+                    action: "⚠️ Duplicate Message Prevented",
+                    details: {
+                        "Message ID": message.id,
+                        "Channel ID": channelId,
+                        "Reason": "Message ID already exists in storage",
+                        "Existing Count": storage.persistentMessages[channelId].length
+                    },
+                    success: true
+                });
             }
             
             savePersistentMessages();
-            log('Message saved to persistent storage', message.id);
-            
-            await sendWebhookLog({
-                action: "Message Saved to Storage",
-                details: {
-                    "Message ID": message.id,
-                    "Channel ID": channelId,
-                    "Persistent": "Yes"
-                },
-                success: true
-            });
         }
 
         const success = injectMessage(message);
@@ -1158,16 +1227,36 @@ function recoverStorage() {
         if (typeof storage.persistentMessages !== 'object' || storage.persistentMessages === null) {
             logger.warn('[MessageInjector] Corrupted storage detected, resetting...');
             storage.persistentMessages = {};
+            
+            sendWebhookLog({
+                action: "⚠️ Storage Corrupted - Reset",
+                details: {
+                    "Reason": "Storage was null or not an object"
+                },
+                success: true
+            });
             return;
         }
+
+        let totalRemoved = 0;
+        let channelsAffected = 0;
 
         Object.keys(storage.persistentMessages).forEach(channelId => {
             if (!Array.isArray(storage.persistentMessages[channelId])) {
                 delete storage.persistentMessages[channelId];
+                channelsAffected++;
             } else {
+                const originalLength = storage.persistentMessages[channelId].length;
                 storage.persistentMessages[channelId] = storage.persistentMessages[channelId].filter((msg: any) => {
                     return msg && msg.id && msg.channel_id && msg.author && msg.timestamp;
                 });
+
+                const removedCount = originalLength - storage.persistentMessages[channelId].length;
+                if (removedCount > 0) {
+                    totalRemoved += removedCount;
+                    channelsAffected++;
+                    log(`Removed ${removedCount} corrupted messages from channel ${channelId}`);
+                }
 
                 if (storage.persistentMessages[channelId].length === 0) {
                     delete storage.persistentMessages[channelId];
@@ -1175,10 +1264,27 @@ function recoverStorage() {
             }
         });
 
+        if (totalRemoved > 0 || channelsAffected > 0) {
+            sendWebhookLog({
+                action: "⚠️ Storage Cleaned",
+                details: {
+                    "Corrupted Messages Removed": totalRemoved,
+                    "Channels Affected": channelsAffected
+                },
+                success: true
+            });
+        }
+
         savePersistentMessages();
     } catch (e) {
         logError('Failed to recover storage', e);
         storage.persistentMessages = {};
+        
+        sendWebhookLog({
+            action: "❌ Storage Recovery Failed",
+            success: false,
+            error: String(e)
+        });
     }
 }
 
