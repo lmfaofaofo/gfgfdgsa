@@ -373,9 +373,11 @@ export default () => {
 
                 <FormInput
                     title="MESSAGE CONTENT"
-                    placeholder="The message text"
+                    placeholder="The message text (supports multiple lines)"
                     value={messageContent}
                     onChange={setMessageContent}
+                    multiline={true}
+                    numberOfLines={4}
                 />
 
                 <FormInput
@@ -447,6 +449,8 @@ export default () => {
                     placeholder="Description (max 4096 characters)"
                     value={embedDescription}
                     onChange={setEmbedDescription}
+                    multiline={true}
+                    numberOfLines={4}
                 />
 
                 <FormInput
